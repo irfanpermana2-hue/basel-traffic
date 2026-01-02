@@ -260,71 +260,124 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "Interval vs Occ + CI 95%"
 ])
 
-# 1) PIE CHART weekday/weekend
-with tab1:
-    st.subheader("Proporsi Hari Kerja vs Akhir Pekan")
-    pie_df = df.copy().dropna(subset=["kategori_hari"])
-    counts = pie_df["kategori_hari"].value_counts()
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import streamlit as st
 
-    fig, ax = plt.subplots(figsize=(6, 6))
+sns.set_style("whitegrid")
+
+# =========================
+#  Helper: label weekday/weekend
+# =========================
+def add_day_type(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["day"] = pd.to_datetime(df["day"], errors="coerce")
+    df["day_type"] = np.where(df["day"].dt.dayofweek < 5, "Hari Kerja", "Akhir Pekan")
+    return df
+
+# =========================
+#  1) PIE CHART: Hari Kerja vs Akhir Pekan
+# =========================
+def pie_weekday_weekend_fig(df: pd.DataFrame):
+    df2 = add_day_type(df)
+
+    counts = df2["day_type"].value_counts(dropna=False)
+    labels = counts.index.astype(str)
+    sizes = counts.values
+
+    fig, ax = plt.subplots(figsize=(7, 5))
     ax.pie(
-        counts.values,
-        labels=counts.index,
-        autopct="%.1f%%",
+        sizes,
+        labels=labels,
+        autopct="%1.1f%%",
         startangle=90
     )
-    ax.set_title("Distribusi Kategori Hari")
-    st.pyplot(fig)
+    ax.set_title("Pie Chart: Hari Kerja vs Akhir Pekan (Proporsi Data)")
+    ax.axis("equal")
+    return fig
 
-    st.write(
-        "Pie chart menunjukkan perbandingan persentase jumlah data pada **Hari Kerja** dan **Akhir Pekan**. "
-        "Ini membantu memahami dominasi data berdasarkan jenis hari."
-    )
+# =========================
+#  2) HISTOGRAM: distribusi flow
+# =========================
+def histogram_flow_fig(df: pd.DataFrame):
+    df2 = df.copy()
+    df2["flow"] = pd.to_numeric(df2["flow"], errors="coerce")
+    df2 = df2.dropna(subset=["flow"])
 
-# 2) HISTOGRAM flow
-with tab2:
-    st.subheader("Distribusi Target Flow (Histogram)")
-    d = df.copy()
     fig, ax = plt.subplots(figsize=(10, 5))
-    sns.histplot(d["flow"].dropna(), kde=True, bins=50, ax=ax)
-    ax.set_title("Distribusi Aliran Lalu Lintas (Flow)")
+    sns.histplot(df2["flow"], kde=True, bins=50, ax=ax)
+    ax.set_title("Histogram Distribusi Flow")
     ax.set_xlabel("Flow")
     ax.set_ylabel("Frekuensi")
-    st.pyplot(fig)
+    return fig
 
-    st.write(
-        "Histogram dibuat untuk melihat distribusi variabel target **flow**. "
-        "Jika grafik condong ke kanan (right-skewed), artinya sebagian besar kondisi lalu lintas "
-        "bernilai flow rendah (lebih sering lengang), sedangkan flow tinggi (macet) lebih jarang."
+# =========================
+#  3) BOXPLOT: outlier flow
+# =========================
+def boxplot_flow_fig(df: pd.DataFrame):
+    df2 = df.copy()
+    df2["flow"] = pd.to_numeric(df2["flow"], errors="coerce")
+    df2 = df2.dropna(subset=["flow"])
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.boxplot(y=df2["flow"], ax=ax)
+    ax.set_title("Boxplot Flow (Outlier)")
+    ax.set_ylabel("Flow")
+    return fig
+
+# =========================
+#  4) Interval vs Occ + CI 95% (24 jam)
+#     FIX ERROR fill_between: gunakan reset_index + to_numpy()
+# =========================
+def interval_occ_ci_fig(df: pd.DataFrame):
+    df2 = df.copy()
+
+    # pastikan numeric
+    df2["interval"] = pd.to_numeric(df2["interval"], errors="coerce")
+    df2["occ"] = pd.to_numeric(df2["occ"], errors="coerce")
+
+    # buang NaN penting
+    df2 = df2.dropna(subset=["interval", "occ"])
+
+    # interval di dataset kamu = detik dalam 1 hari (0..86100)
+    # ubah jadi jam 0..23 (dibulatkan)
+    df2["hour"] = np.floor(df2["interval"] / 3600).astype(int)
+    df2 = df2[(df2["hour"] >= 0) & (df2["hour"] <= 23)]
+
+    # agregasi per hour
+    grp = (
+        df2.groupby("hour", as_index=False)
+        .agg(mean_occ=("occ", "mean"),
+             std_occ=("occ", "std"),
+             n=("occ", "count"))
+        .sort_values("hour")
+        .reset_index(drop=True)
     )
 
-# 3) BOX PLOT flow
-with tab3:
-    st.subheader("Boxplot Flow (Outlier)")
-    d = df.copy()
-    fig, ax = plt.subplots(figsize=(10, 4))
-    sns.boxplot(x=d["flow"], ax=ax)
-    ax.set_title("Box Plot Sebaran Flow")
-    ax.set_xlabel("Flow")
-    st.pyplot(fig)
+    # kalau std NaN (misal n=1), set 0 biar aman
+    grp["std_occ"] = grp["std_occ"].fillna(0)
 
-    st.write(
-        "Boxplot memberikan ringkasan statistik visual untuk flow. "
-        "Titik di luar 'kumis' (whisker) adalah **outlier**, menunjukkan adanya kejadian lalu lintas ekstrem "
-        "(flow sangat tinggi) meskipun jarang."
-    )
+    # CI 95% = mean ± 1.96 * (std/sqrt(n))
+    grp["se"] = grp["std_occ"] / np.sqrt(grp["n"].clip(lower=1))
+    grp["ci_low"] = grp["mean_occ"] - 1.96 * grp["se"]
+    grp["ci_high"] = grp["mean_occ"] + 1.96 * grp["se"]
 
-# 4) Interval vs Occ + CI 95%
-with tab4:
-    st.subheader("Grafik Interval vs Okupansi Jalan (occ) dalam 24 jam + CI 95%")
-    st.caption("Menggunakan data hasil filter (detid & jenis hari) agar sesuai pilihan pengguna.")
-    fig = interval_occ_ci_plot(df_f)
-    if fig is None:
-        st.warning("Tidak ada data occ/interval untuk membuat grafik.")
-    else:
-        st.pyplot(fig)
+    # plotting (PASTI 1-D)
+    x = grp["hour"].to_numpy()
+    y = grp["mean_occ"].to_numpy()
+    y1 = grp["ci_low"].to_numpy()
+    y2 = grp["ci_high"].to_numpy()
 
-    st.write(
-        "Garis menunjukkan **rata-rata occ** pada setiap jam (0–24). Area bayangan adalah **Confidence Interval (CI) 95%**. "
-        "Jika area CI sempit, variasi data kecil dan estimasi lebih stabil; jika CI lebar, variasi lebih besar."
-    )
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    ax.plot(x, y, linewidth=2, label="Rata-rata occ")
+    ax.fill_between(x, y1, y2, alpha=0.2, label="CI 95%")
+
+    ax.set_title("Grafik Interval vs Okupansi Jalan (occ) dalam 24 Jam + CI 95%")
+    ax.set_xlabel("Jam (0–23) dari interval/3600")
+    ax.set_ylabel("Okupansi (occ)")
+    ax.set_xticks(range(0, 24, 1))
+    ax.legend()
+    return fig
+
