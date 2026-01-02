@@ -1,256 +1,302 @@
 import pandas as pd
 import numpy as np
-import streamlit as st
-
 import matplotlib.pyplot as plt
 import seaborn as sns
+import streamlit as st
 
-st.set_page_config(page_title="Basel Traffic", layout="wide")
 sns.set_style("whitegrid")
 
 # =========================
-# Load + Prep
+# CONFIG
 # =========================
-@st.cache_data
-def load_data(path="basel.csv"):
+st.set_page_config(page_title="Basel Traffic", layout="wide")
+
+DATA_PATH = "basel.csv"
+
+# =========================
+# LOAD DATA
+# =========================
+@st.cache_data(show_spinner=False)
+def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
 
-    # typing
+    # Standardize columns (sesuai dataset kamu)
+    # day (object) -> datetime
     df["day"] = pd.to_datetime(df["day"], errors="coerce")
-    df["interval"] = pd.to_numeric(df["interval"], errors="coerce")
-    df["flow"] = pd.to_numeric(df["flow"], errors="coerce")
-    df["occ"]  = pd.to_numeric(df["occ"], errors="coerce")
 
-    # interval seconds -> hour (0-24)
-    df["hour"] = df["interval"] / 3600.0
-    df["hour_bin"] = np.floor(df["hour"]).astype("Int64")
+    # numeric columns
+    for col in ["interval", "flow", "occ", "error", "speed"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # weekday category
-    df["kategori_hari"] = df["day"].dt.weekday.apply(lambda x: "Akhir Pekan" if x in [5, 6] else "Hari Kerja")
+    # detid/city tetap object
+    if "detid" in df.columns:
+        df["detid"] = df["detid"].astype(str)
+    if "city" in df.columns:
+        df["city"] = df["city"].astype(str)
+
+    # hour (0-23) dari interval detik (0..86100)
+    # interval/3600 -> floor jadi jam
+    df["hour"] = np.floor(df["interval"] / 3600).astype("Int64")
+    df.loc[(df["hour"] < 0) | (df["hour"] > 23), "hour"] = pd.NA
+
+    # day_type: Hari Kerja vs Akhir Pekan
+    df["day_type"] = np.where(df["day"].dt.dayofweek < 5, "Hari Kerja", "Akhir Pekan")
+
     return df
 
 
-def drop_useless_columns(df, null_threshold=0.95):
-    null_ratio = df.isna().mean()
-    drop_cols = null_ratio[null_ratio >= null_threshold].index.tolist()
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-    return df
+df_raw = load_data(DATA_PATH)
 
-
-def get_thresholds(flow_series: pd.Series, sensitivity: str):
+# =========================
+# HELPERS
+# =========================
+def status_kepadatan_from_flow_occ(flow_mean: float, occ_mean: float, sensitivity: str = "Sedang") -> str:
     """
-    Sensitivitas mengubah batas kategori kepadatan.
-    - Rendah: lebih longgar
-    - Sedang: default
-    - Tinggi: lebih ketat
+    Menentukan status kepadatan (Lancar/Sedang/Padat) dari mean flow & mean occ.
+    Threshold sederhana, bisa kamu ubah sesuai kebutuhan laporan.
     """
-    s = flow_series.dropna()
-    if len(s) == 0:
-        return None
+    sens_map = {
+        "Rendah": 0.85,
+        "Sedang": 1.00,
+        "Tinggi": 1.15,
+    }
+    k = sens_map.get(sensitivity, 1.00)
 
-    if sensitivity == "Rendah":
-        qs = [0.35, 0.65, 0.85]
-    elif sensitivity == "Tinggi":
-        qs = [0.15, 0.35, 0.60]
-    else:
-        qs = [0.25, 0.50, 0.75]
-
-    q1, q2, q3 = s.quantile(qs).tolist()
-    return q1, q2, q3
-
-
-def classify_status(flow_value, thresholds):
-    if thresholds is None or pd.isna(flow_value):
-        return "Tidak tersedia"
-    q1, q2, q3 = thresholds
-    if flow_value <= q1:
-        return "Lancar"
-    elif flow_value <= q2:
-        return "Sedang"
-    elif flow_value <= q3:
+    # Threshold heuristik (aman & masuk akal utk demo)
+    # occ biasanya 0..1, flow bisa 0..1344 (dari dataset kamu)
+    if (occ_mean >= 0.08 * k) or (flow_mean >= 220 * k):
         return "Padat"
-    return "Sangat Padat"
+    elif (occ_mean >= 0.04 * k) or (flow_mean >= 120 * k):
+        return "Sedang"
+    else:
+        return "Lancar"
 
 
-def agg_24h(df_f):
-    return (
-        df_f.dropna(subset=["hour_bin"])
-            .groupby("hour_bin", as_index=False)
-            .agg(flow_mean=("flow","mean"), occ_mean=("occ","mean"), n=("flow","size"))
-            .sort_values("hour_bin")
-    )
+@st.cache_data(show_spinner=False)
+def hourly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ringkas per jam: mean flow, mean occ, jumlah data.
+    """
+    tmp = df.dropna(subset=["hour", "flow", "occ"]).copy()
+    tmp["hour"] = tmp["hour"].astype(int)
 
-
-def agg_by_detid_at_hour(df_f, hour_selected: int):
-    d = df_f[df_f["hour_bin"] == hour_selected].copy()
-    if "detid" not in d.columns:
-        return pd.DataFrame()
     out = (
-        d.dropna(subset=["detid"])
-         .groupby("detid", as_index=False)
-         .agg(flow_mean=("flow","mean"), occ_mean=("occ","mean"), n=("flow","size"))
-         .sort_values("flow_mean", ascending=False)
+        tmp.groupby("hour", as_index=False)
+        .agg(
+            flow_mean=("flow", "mean"),
+            occ_mean=("occ", "mean"),
+            jumlah_data=("flow", "count"),
+        )
+        .sort_values("hour")
+        .reset_index(drop=True)
     )
     return out
 
 
-# =========================
-# Interval vs Occ + CI 95%
-# =========================
-def interval_occ_ci_plot(df_f: pd.DataFrame, ax=None):
-    """
-    Plot mean occ by time (hour 0-24) with 95% CI band.
-    CI approx: mean ± 1.96 * (std/sqrt(n))
-    """
-    d = df_f.dropna(subset=["occ", "interval"]).copy()
-    if len(d) == 0:
-        return None
-
-    d["hour"] = d["interval"] / 3600.0
-
-    grp = (
-        d.groupby("hour", as_index=False)["occ"]
-         .agg(["mean", "std", "count"])
-         .reset_index()
-         .rename(columns={"index": "hour"})
-    )
-    grp["se"] = grp["std"] / np.sqrt(grp["count"].replace(0, np.nan))
-    grp["ci_low"] = grp["mean"] - 1.96 * grp["se"]
-    grp["ci_high"] = grp["mean"] + 1.96 * grp["se"]
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(12, 4))
-    else:
-        fig = ax.figure
-
-    ax.plot(grp["hour"], grp["mean"], label="Rata-rata occ")
-    ax.fill_between(grp["hour"], grp["ci_low"], grp["ci_high"], alpha=0.2, label="CI 95%")
-    ax.set_title("Grafik Interval vs Okupansi jalan (occ) dalam 24 jam")
-    ax.set_xlabel("Waktu (jam) 0–24  [interval/3600]")
-    ax.set_ylabel("Okupansi (occ)")
+def line_chart_24h(df_hour: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(df_hour["hour"], df_hour["flow_mean"], linewidth=2, label="flow_mean")
+    ax.plot(df_hour["hour"], df_hour["occ_mean"], linewidth=2, label="occ_mean")
+    ax.set_title("Grafik 24 Jam (Rata-rata Historis)")
+    ax.set_xlabel("Jam (0–23)")
+    ax.set_ylabel("Nilai Rata-rata")
+    ax.set_xticks(range(0, 24, 1))
     ax.legend()
     return fig
 
 
 # =========================
-# UI Header
+# EDA FIGURES (yang kamu minta)
+# =========================
+def pie_weekday_weekend_fig(df: pd.DataFrame):
+    counts = df["day_type"].value_counts(dropna=False)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.pie(counts.values, labels=counts.index.astype(str), autopct="%1.1f%%", startangle=90)
+    ax.set_title("Pie Chart: Hari Kerja vs Akhir Pekan (Proporsi Data)")
+    ax.axis("equal")
+    return fig
+
+
+def histogram_flow_fig(df: pd.DataFrame):
+    tmp = df.dropna(subset=["flow"]).copy()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    sns.histplot(tmp["flow"], kde=True, bins=50, ax=ax)
+    ax.set_title("Histogram Distribusi Flow")
+    ax.set_xlabel("Flow")
+    ax.set_ylabel("Frekuensi")
+    return fig
+
+
+def boxplot_flow_fig(df: pd.DataFrame):
+    tmp = df.dropna(subset=["flow"]).copy()
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.boxplot(y=tmp["flow"], ax=ax)
+    ax.set_title("Boxplot Flow (Outlier)")
+    ax.set_ylabel("Flow")
+    return fig
+
+
+def interval_occ_ci_fig(df: pd.DataFrame):
+    """
+    Grafik Interval (jam 0-23) vs occ + CI 95%
+    FIX: memastikan data 1D dengan reset_index + to_numpy().
+    """
+    tmp = df.dropna(subset=["hour", "occ"]).copy()
+    tmp["hour"] = tmp["hour"].astype(int)
+    tmp = tmp[(tmp["hour"] >= 0) & (tmp["hour"] <= 23)]
+
+    grp = (
+        tmp.groupby("hour", as_index=False)
+        .agg(mean_occ=("occ", "mean"), std_occ=("occ", "std"), n=("occ", "count"))
+        .sort_values("hour")
+        .reset_index(drop=True)
+    )
+
+    grp["std_occ"] = grp["std_occ"].fillna(0)
+    grp["se"] = grp["std_occ"] / np.sqrt(grp["n"].clip(lower=1))
+    grp["ci_low"] = grp["mean_occ"] - 1.96 * grp["se"]
+    grp["ci_high"] = grp["mean_occ"] + 1.96 * grp["se"]
+
+    x = grp["hour"].to_numpy()
+    y = grp["mean_occ"].to_numpy()
+    y1 = grp["ci_low"].to_numpy()
+    y2 = grp["ci_high"].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    ax.plot(x, y, linewidth=2, label="Rata-rata occ")
+    ax.fill_between(x, y1, y2, alpha=0.2, label="CI 95%")
+    ax.set_title("Grafik Interval vs Okupansi Jalan (occ) dalam 24 Jam + CI 95%")
+    ax.set_xlabel("Jam (0–23) dari interval/3600")
+    ax.set_ylabel("Okupansi (occ)")
+    ax.set_xticks(range(0, 24, 1))
+    ax.legend()
+    return fig
+
+
+# =========================
+# SIDEBAR FILTERS
 # =========================
 st.markdown(
     """
-    <div style="background:#1f4b8f;padding:18px 18px;border-radius:12px;margin-bottom:14px;">
-        <h1 style="color:white;margin:0;">Basel Traffic</h1>
-        <p style="color:#dbe8ff;margin:4px 0 0 0;">
-            Sistem pemantauan & estimasi lalu lintas berbasis data historis (interval 24 jam).
-        </p>
+    <div style="background:#1f4e8c;padding:22px;border-radius:14px;color:white;">
+      <h1 style="margin:0;">Basel Traffic</h1>
+      <p style="margin:8px 0 0 0;">
+        Sistem pemantauan & estimasi lalu lintas berbasis data historis (interval 24 jam).
+      </p>
     </div>
     """,
     unsafe_allow_html=True
 )
 
-# =========================
-# Load data
-# =========================
-df = load_data("basel.csv")
-df = drop_useless_columns(df, null_threshold=0.95)
+st.write("")
+
+# Filter bar
+c1, c2, c3 = st.columns([1.2, 2.2, 2.2])
+with c1:
+    jam_pilih = st.slider("Pilih Jam (0–23)", 0, 23, 12)
+
+detector_list = ["Semua Detektor"] + sorted(df_raw["detid"].dropna().unique().tolist())
+with c2:
+    detid_pilih = st.selectbox("Filter Detektor", detector_list, index=0)
+
+with c3:
+    jenis_hari = st.selectbox("Jenis Hari", ["Semua", "Hari Kerja", "Akhir Pekan"], index=0)
+
+c4, _ = st.columns([2.2, 7.8])
+with c4:
+    sens = st.selectbox("Sensitivitas Kepadatan", ["Rendah", "Sedang", "Tinggi"], index=1)
 
 # =========================
-# TOP CONTROLS
+# APPLY FILTERS
 # =========================
-cA, cB, cC, cD = st.columns([1.2, 1.3, 1.2, 1.3])
+df_f = df_raw.copy()
 
-with cA:
-    hour_selected = st.slider("Pilih Jam (0–23)", 0, 23, 12, 1)
+if detid_pilih != "Semua Detektor":
+    df_f = df_f[df_f["detid"] == detid_pilih]
 
-with cB:
-    detids = ["Semua Detektor"] + (sorted(df["detid"].dropna().unique().tolist()) if "detid" in df.columns else [])
-    detid_selected = st.selectbox("Filter Detektor", detids)
+if jenis_hari != "Semua":
+    df_f = df_f[df_f["day_type"] == jenis_hari]
 
-with cC:
-    day_mode = st.selectbox("Jenis Hari", ["Semua", "Hari Kerja", "Akhir Pekan"])
-
-with cD:
-    sensitivity = st.selectbox("Sensitivitas Kepadatan", ["Sedang", "Rendah", "Tinggi"])
-
-# Apply filters
-df_f = df.copy()
-
-if day_mode != "Semua":
-    df_f = df_f[df_f["kategori_hari"] == day_mode]
-
-if detid_selected != "Semua Detektor" and "detid" in df_f.columns:
-    df_f = df_f[df_f["detid"] == detid_selected]
-
-# Summaries
-agg24 = agg_24h(df_f)
-row = agg24[agg24["hour_bin"] == hour_selected]
-flow_est = row["flow_mean"].iloc[0] if len(row) else np.nan
-occ_est  = row["occ_mean"].iloc[0] if len(row) else np.nan
-n_est    = int(row["n"].iloc[0]) if len(row) else 0
-
-thresholds = get_thresholds(df_f["flow"], sensitivity)
-status = classify_status(flow_est, thresholds)
-
-# Status highlight
-if status in ["Sangat Padat", "Padat"]:
-    st.warning(f"Status Lalu Lintas: **{status}**")
-elif status == "Sedang":
-    st.info(f"Status Lalu Lintas: **{status}**")
-else:
-    st.success(f"Status Lalu Lintas: **{status}**")
-
-st.markdown("---")
+# Pastikan hour valid
+df_f = df_f.dropna(subset=["hour"])
+df_f["hour"] = df_f["hour"].astype(int)
 
 # =========================
-# MAIN LAYOUT
+# STATUS & SUMMARY FOR SELECTED HOUR
 # =========================
-left, right = st.columns([1.15, 1])
+df_hour_selected = df_f[df_f["hour"] == jam_pilih].copy()
+
+flow_mean_h = float(df_hour_selected["flow"].mean()) if len(df_hour_selected) else np.nan
+occ_mean_h = float(df_hour_selected["occ"].mean()) if len(df_hour_selected) else np.nan
+n_h = int(df_hour_selected["flow"].count()) if len(df_hour_selected) else 0
+
+status = status_kepadatan_from_flow_occ(
+    0.0 if np.isnan(flow_mean_h) else flow_mean_h,
+    0.0 if np.isnan(occ_mean_h) else occ_mean_h,
+    sensitivity=sens
+)
+
+st.info(f"Status Lalu Lintas: **{status}**")
+
+# =========================
+# MAIN LAYOUT (mirip contoh Melbourne)
+# =========================
+left, right = st.columns([1.15, 1.0])
 
 with left:
     st.subheader("Peta / Visualisasi Lalu Lintas Basel")
 
-    has_coords = all(col in df_f.columns for col in ["lat", "lon"])
-    if has_coords:
-        det_hour = df_f[df_f["hour_bin"] == hour_selected].dropna(subset=["lat", "lon"])
-        st.map(det_hour.rename(columns={"lat":"latitude","lon":"longitude"}))
-        st.caption("Peta menampilkan titik sensor pada jam yang dipilih.")
-    else:
-        st.info("Dataset Basel tidak memiliki kolom koordinat (lat/lon), jadi peta tidak bisa ditampilkan. "
-                "Sebagai pengganti, ditampilkan Top Detektor (flow tertinggi) pada jam yang dipilih.")
+    st.markdown(
+        """
+        <div style="background:#e9f2ff;padding:14px;border-radius:10px;">
+        Dataset Basel tidak memiliki kolom koordinat (lat/lon), jadi peta tidak bisa ditampilkan.
+        Sebagai pengganti, ditampilkan <b>Top Detektor</b> (flow tertinggi) pada jam yang dipilih.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    st.write("")
 
-        det_rank = agg_by_detid_at_hour(df_f, hour_selected)
-        if len(det_rank) == 0:
-            st.warning("Tidak ada data untuk jam/filter yang dipilih.")
-        else:
-            top10 = det_rank.head(10)
-            st.dataframe(top10, use_container_width=True, height=260)
-            st.bar_chart(top10.set_index("detid")[["flow_mean"]], height=260)
+    top_table = (
+        df_hour_selected.dropna(subset=["flow", "occ"])
+        .groupby("detid", as_index=False)
+        .agg(flow_mean=("flow", "mean"), occ_mean=("occ", "mean"), n=("flow", "count"))
+        .sort_values("flow_mean", ascending=False)
+        .head(10)
+    )
+    st.dataframe(top_table, use_container_width=True, height=260)
 
 with right:
     st.subheader("Prediksi & Analisis Lalu Lintas (Historis)")
 
-    r1, r2 = st.columns(2)
-    r1.metric("Volume Lalu Lintas (Flow Mean)", "—" if pd.isna(flow_est) else f"{flow_est:.2f}")
-    r2.metric("Okupansi Jalan (Occ Mean)", "—" if pd.isna(occ_est) else f"{occ_est:.4f}")
+    m1, m2, m3, m4 = st.columns(4)
 
-    r3, r4 = st.columns(2)
-    r3.metric("Jam Dipilih", f"{hour_selected}:00")
-    r4.metric("Jumlah Data (jam itu)", f"{n_est:,}")
+    m1.metric("Volume Lalu Lintas (Flow Mean)", f"{0.0 if np.isnan(flow_mean_h) else flow_mean_h:.2f}")
+    m2.metric("Okupansi Jalan (Occ Mean)", f"{0.0 if np.isnan(occ_mean_h) else occ_mean_h:.4f}")
+    m3.metric("Jam Dipilih", f"{jam_pilih:02d}:00")
+    m4.metric("Jumlah Data (jam itu)", f"{n_h:,}")
 
-    st.markdown("#### Grafik 24 Jam (Rata-rata Historis)")
-    if len(agg24) == 0:
-        st.warning("Data kosong setelah filter.")
-    else:
-        st.line_chart(agg24.set_index("hour_bin")[["flow_mean"]], height=220)
-        st.line_chart(agg24.set_index("hour_bin")[["occ_mean"]], height=220)
+    st.write("")
+    # 24h summary (berdasarkan data yang sudah difilter)
+    df_hour_sum = hourly_summary(df_f)
 
-    st.caption("Catatan: Estimasi memakai rata-rata historis pada jam yang sama (tanpa training ML saat deploy).")
+    fig_line = line_chart_24h(df_hour_sum)
+    st.pyplot(fig_line, clear_figure=True)
 
-st.markdown("---")
+    st.caption("Grafik menunjukkan rata-rata flow dan occ per jam (0–23) berdasarkan data historis (setelah filter).")
 
 # =========================
-# EDA SECTION (tambahan yang kamu minta)
+# TABLE SUMMARY
 # =========================
+st.write("")
+st.subheader("Tabel Ringkas per Jam")
+st.dataframe(df_hour_sum, use_container_width=True, height=320)
+
+# =========================
+# EDA TABS (Pie, Histogram, Boxplot, Interval vs Occ + CI)
+# =========================
+st.write("")
 st.header("EDA (Exploratory Data Analysis)")
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -260,124 +306,35 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "Interval vs Occ + CI 95%"
 ])
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import streamlit as st
-
-sns.set_style("whitegrid")
-
-# =========================
-#  Helper: label weekday/weekend
-# =========================
-def add_day_type(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["day"] = pd.to_datetime(df["day"], errors="coerce")
-    df["day_type"] = np.where(df["day"].dt.dayofweek < 5, "Hari Kerja", "Akhir Pekan")
-    return df
-
-# =========================
-#  1) PIE CHART: Hari Kerja vs Akhir Pekan
-# =========================
-def pie_weekday_weekend_fig(df: pd.DataFrame):
-    df2 = add_day_type(df)
-
-    counts = df2["day_type"].value_counts(dropna=False)
-    labels = counts.index.astype(str)
-    sizes = counts.values
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.pie(
-        sizes,
-        labels=labels,
-        autopct="%1.1f%%",
-        startangle=90
+with tab1:
+    st.write(
+        "Pie chart menunjukkan perbandingan persentase jumlah data pada **Hari Kerja** dan **Akhir Pekan**."
     )
-    ax.set_title("Pie Chart: Hari Kerja vs Akhir Pekan (Proporsi Data)")
-    ax.axis("equal")
-    return fig
+    fig = pie_weekday_weekend_fig(df_f if jenis_hari == "Semua" else df_raw)  # biar pie chart tetap relevan
+    st.pyplot(fig, clear_figure=True)
 
-# =========================
-#  2) HISTOGRAM: distribusi flow
-# =========================
-def histogram_flow_fig(df: pd.DataFrame):
-    df2 = df.copy()
-    df2["flow"] = pd.to_numeric(df2["flow"], errors="coerce")
-    df2 = df2.dropna(subset=["flow"])
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    sns.histplot(df2["flow"], kde=True, bins=50, ax=ax)
-    ax.set_title("Histogram Distribusi Flow")
-    ax.set_xlabel("Flow")
-    ax.set_ylabel("Frekuensi")
-    return fig
-
-# =========================
-#  3) BOXPLOT: outlier flow
-# =========================
-def boxplot_flow_fig(df: pd.DataFrame):
-    df2 = df.copy()
-    df2["flow"] = pd.to_numeric(df2["flow"], errors="coerce")
-    df2 = df2.dropna(subset=["flow"])
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    sns.boxplot(y=df2["flow"], ax=ax)
-    ax.set_title("Boxplot Flow (Outlier)")
-    ax.set_ylabel("Flow")
-    return fig
-
-# =========================
-#  4) Interval vs Occ + CI 95% (24 jam)
-#     FIX ERROR fill_between: gunakan reset_index + to_numpy()
-# =========================
-def interval_occ_ci_fig(df: pd.DataFrame):
-    df2 = df.copy()
-
-    # pastikan numeric
-    df2["interval"] = pd.to_numeric(df2["interval"], errors="coerce")
-    df2["occ"] = pd.to_numeric(df2["occ"], errors="coerce")
-
-    # buang NaN penting
-    df2 = df2.dropna(subset=["interval", "occ"])
-
-    # interval di dataset kamu = detik dalam 1 hari (0..86100)
-    # ubah jadi jam 0..23 (dibulatkan)
-    df2["hour"] = np.floor(df2["interval"] / 3600).astype(int)
-    df2 = df2[(df2["hour"] >= 0) & (df2["hour"] <= 23)]
-
-    # agregasi per hour
-    grp = (
-        df2.groupby("hour", as_index=False)
-        .agg(mean_occ=("occ", "mean"),
-             std_occ=("occ", "std"),
-             n=("occ", "count"))
-        .sort_values("hour")
-        .reset_index(drop=True)
+with tab2:
+    st.write(
+        "Histogram dibuat untuk melihat distribusi target **flow**. Jika condong ke kanan (right-skewed), "
+        "artinya flow rendah lebih sering terjadi, sedangkan flow tinggi (macet) lebih jarang."
     )
+    fig = histogram_flow_fig(df_f)
+    st.pyplot(fig, clear_figure=True)
 
-    # kalau std NaN (misal n=1), set 0 biar aman
-    grp["std_occ"] = grp["std_occ"].fillna(0)
+with tab3:
+    st.write(
+        "Boxplot memberikan ringkasan statistik visual untuk **flow**. Titik di luar whisker adalah **outlier** "
+        "(kejadian ekstrem)."
+    )
+    fig = boxplot_flow_fig(df_f)
+    st.pyplot(fig, clear_figure=True)
 
-    # CI 95% = mean ± 1.96 * (std/sqrt(n))
-    grp["se"] = grp["std_occ"] / np.sqrt(grp["n"].clip(lower=1))
-    grp["ci_low"] = grp["mean_occ"] - 1.96 * grp["se"]
-    grp["ci_high"] = grp["mean_occ"] + 1.96 * grp["se"]
+with tab4:
+    st.write(
+        "Grafik ini menunjukkan pola okupansi jalan (**occ**) rata-rata per jam (0–23). "
+        "Area bayangan adalah **CI 95%** (rentang ketidakpastian rata-rata)."
+    )
+    fig = interval_occ_ci_fig(df_f)
+    st.pyplot(fig, clear_figure=True)
 
-    # plotting (PASTI 1-D)
-    x = grp["hour"].to_numpy()
-    y = grp["mean_occ"].to_numpy()
-    y1 = grp["ci_low"].to_numpy()
-    y2 = grp["ci_high"].to_numpy()
-
-    fig, ax = plt.subplots(figsize=(11, 4.5))
-    ax.plot(x, y, linewidth=2, label="Rata-rata occ")
-    ax.fill_between(x, y1, y2, alpha=0.2, label="CI 95%")
-
-    ax.set_title("Grafik Interval vs Okupansi Jalan (occ) dalam 24 Jam + CI 95%")
-    ax.set_xlabel("Jam (0–23) dari interval/3600")
-    ax.set_ylabel("Okupansi (occ)")
-    ax.set_xticks(range(0, 24, 1))
-    ax.legend()
-    return fig
-
+st.caption("Catatan: Deploy ini menggunakan pendekatan statistik sederhana (rata-rata historis per jam). Tidak ada proses training model ML saat deploy.")
