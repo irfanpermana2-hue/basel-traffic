@@ -2,56 +2,61 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-# =========================
-# CONFIG
-# =========================
-st.set_page_config(page_title="Basel Traffic (Historis)", layout="wide")
+st.set_page_config(page_title="Basel Traffic", layout="wide")
 
 # =========================
-# FUNCTIONS
+# Load + Prep
 # =========================
 @st.cache_data
-def load_data(path: str = "basel.csv") -> pd.DataFrame:
+def load_data(path="basel.csv"):
     df = pd.read_csv(path)
 
-    # Convert types safely
+    # typing
     df["day"] = pd.to_datetime(df["day"], errors="coerce")
     df["interval"] = pd.to_numeric(df["interval"], errors="coerce")
     df["flow"] = pd.to_numeric(df["flow"], errors="coerce")
-    df["occ"] = pd.to_numeric(df["occ"], errors="coerce")
+    df["occ"]  = pd.to_numeric(df["occ"], errors="coerce")
 
-    # interval (seconds) -> hour
+    # interval seconds -> hour (0-24)
     df["hour"] = df["interval"] / 3600.0
     df["hour_bin"] = np.floor(df["hour"]).astype("Int64")
 
     # weekday category
-    df["kategori_hari"] = df["day"].dt.weekday.apply(
-        lambda x: "Akhir Pekan" if x in [5, 6] else "Hari Kerja"
-    )
-
+    df["kategori_hari"] = df["day"].dt.weekday.apply(lambda x: "Akhir Pekan" if x in [5, 6] else "Hari Kerja")
     return df
 
 
-def drop_useless_columns(df: pd.DataFrame, null_threshold: float = 0.95) -> pd.DataFrame:
-    """Drop columns that are mostly null (default >=95% null)."""
-    df2 = df.copy()
-    null_ratio = df2.isnull().mean()
-    cols_to_drop = null_ratio[null_ratio >= null_threshold].index.tolist()
-    if len(cols_to_drop) > 0:
-        df2 = df2.drop(columns=cols_to_drop)
-    return df2
+def drop_useless_columns(df, null_threshold=0.95):
+    null_ratio = df.isna().mean()
+    drop_cols = null_ratio[null_ratio >= null_threshold].index.tolist()
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    return df
 
 
-def make_flow_thresholds(flow_series: pd.Series):
-    """Auto thresholds by quantiles to classify traffic status."""
+def get_thresholds(flow_series: pd.Series, sensitivity: str):
+    """
+    Sensitivitas mengubah batas kategori kepadatan.
+    - Rendah: lebih 'longgar' (lebih banyak dianggap lancar)
+    - Sedang: default (Q1,Q2,Q3)
+    - Tinggi: lebih 'ketat' (lebih cepat dianggap padat)
+    """
     s = flow_series.dropna()
     if len(s) == 0:
         return None
-    q1, q2, q3 = s.quantile([0.25, 0.50, 0.75]).tolist()
+
+    if sensitivity == "Rendah":
+        qs = [0.35, 0.65, 0.85]
+    elif sensitivity == "Tinggi":
+        qs = [0.15, 0.35, 0.60]
+    else:  # Sedang
+        qs = [0.25, 0.50, 0.75]
+
+    q1, q2, q3 = s.quantile(qs).tolist()
     return q1, q2, q3
 
 
-def classify_status(flow_value: float, thresholds):
+def classify_status(flow_value, thresholds):
     if thresholds is None or pd.isna(flow_value):
         return "Tidak tersedia"
     q1, q2, q3 = thresholds
@@ -61,163 +66,155 @@ def classify_status(flow_value: float, thresholds):
         return "Sedang"
     elif flow_value <= q3:
         return "Padat"
-    else:
-        return "Sangat Padat"
+    return "Sangat Padat"
 
 
-def agg_by_hour(df_f: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate mean flow/occ per hour bin."""
-    agg = (
+def agg_24h(df_f):
+    return (
         df_f.dropna(subset=["hour_bin"])
             .groupby("hour_bin", as_index=False)
-            .agg(
-                flow_mean=("flow", "mean"),
-                occ_mean=("occ", "mean"),
-                n=("flow", "size"),
-            )
+            .agg(flow_mean=("flow","mean"), occ_mean=("occ","mean"), n=("flow","size"))
             .sort_values("hour_bin")
     )
-    return agg
+
+
+def agg_by_detid_at_hour(df_f, hour_selected: int):
+    d = df_f[df_f["hour_bin"] == hour_selected].copy()
+    if "detid" not in d.columns:
+        return pd.DataFrame()
+    out = (
+        d.dropna(subset=["detid"])
+         .groupby("detid", as_index=False)
+         .agg(flow_mean=("flow","mean"), occ_mean=("occ","mean"), n=("flow","size"))
+         .sort_values("flow_mean", ascending=False)
+    )
+    return out
 
 
 # =========================
-# APP UI
+# UI Header (mirip contoh)
 # =========================
-st.title("Basel Traffic")
-st.caption("Deploy berbasis historis: estimasi = rata-rata flow/occ pada jam yang sama (tanpa model ML).")
+st.markdown(
+    """
+    <div style="background:#1f4b8f;padding:18px 18px;border-radius:12px;margin-bottom:14px;">
+        <h1 style="color:white;margin:0;">Basel Traffic</h1>
+        <p style="color:#dbe8ff;margin:4px 0 0 0;">
+            Sistem pemantauan & estimasi lalu lintas berbasis data historis (interval 24 jam).
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-# Load + auto drop mostly-null columns
+# =========================
+# Load data
+# =========================
 df = load_data("basel.csv")
 df = drop_useless_columns(df, null_threshold=0.95)
 
-# Sidebar
-st.sidebar.header("Kontrol & Filter")
-mode_hari = st.sidebar.selectbox("Jenis Hari", ["Semua", "Hari Kerja", "Akhir Pekan"])
+# =========================
+# TOP CONTROLS (mirip Melbourne Traffic)
+# =========================
+cA, cB, cC, cD = st.columns([1.2, 1.3, 1.2, 1.3])
 
-detid_list = sorted(df["detid"].dropna().unique().tolist()) if "detid" in df.columns else []
-detid_selected = st.sidebar.selectbox("Detektor (detid)", ["Semua Detektor"] + detid_list)
+with cA:
+    hour_selected = st.slider("Pilih Jam (0–23)", 0, 23, 12, 1)
 
-jam_selected = st.sidebar.slider("Pilih jam (0–23)", 0, 23, 12, 1)
+with cB:
+    detids = ["Semua Detektor"] + (sorted(df["detid"].dropna().unique().tolist()) if "detid" in df.columns else [])
+    detid_selected = st.selectbox("Filter Detektor", detids)
 
-# Optional: filter by date range if available
-use_date_filter = st.sidebar.checkbox("Filter rentang tanggal (opsional)", value=False)
-date_min = df["day"].min()
-date_max = df["day"].max()
-if use_date_filter and pd.notna(date_min) and pd.notna(date_max):
-    start_date, end_date = st.sidebar.date_input(
-        "Rentang tanggal",
-        value=(date_min.date(), date_max.date()),
-        min_value=date_min.date(),
-        max_value=date_max.date()
-    )
-else:
-    start_date, end_date = None, None
+with cC:
+    day_mode = st.selectbox("Jenis Hari", ["Semua", "Hari Kerja", "Akhir Pekan"])
 
+with cD:
+    sensitivity = st.selectbox("Sensitivitas Kepadatan", ["Sedang", "Rendah", "Tinggi"])
+
+# =========================
 # Apply filters
+# =========================
 df_f = df.copy()
 
-if mode_hari != "Semua":
-    df_f = df_f[df_f["kategori_hari"] == mode_hari]
+if day_mode != "Semua":
+    df_f = df_f[df_f["kategori_hari"] == day_mode]
 
 if detid_selected != "Semua Detektor" and "detid" in df_f.columns:
     df_f = df_f[df_f["detid"] == detid_selected]
 
-if use_date_filter and start_date and end_date:
-    df_f = df_f[(df_f["day"].dt.date >= start_date) & (df_f["day"].dt.date <= end_date)]
+# =========================
+# Compute summaries
+# =========================
+agg24 = agg_24h(df_f)
+row = agg24[agg24["hour_bin"] == hour_selected]
 
-# Build hourly aggregate
-agg = agg_by_hour(df_f)
+flow_est = row["flow_mean"].iloc[0] if len(row) else np.nan
+occ_est  = row["occ_mean"].iloc[0] if len(row) else np.nan
+n_est    = int(row["n"].iloc[0]) if len(row) else 0
 
-# Thresholds for status based on filtered data
-thresholds = make_flow_thresholds(df_f["flow"]) if "flow" in df_f.columns else None
-
-# Pick selected hour row
-row = agg[agg["hour_bin"] == jam_selected]
-if len(row) == 1:
-    flow_est = row["flow_mean"].iloc[0]
-    occ_est = row["occ_mean"].iloc[0]
-    n_est = int(row["n"].iloc[0])
-else:
-    flow_est, occ_est, n_est = np.nan, np.nan, 0
-
+thresholds = get_thresholds(df_f["flow"], sensitivity)
 status = classify_status(flow_est, thresholds)
 
-# =========================
-# SUMMARY METRICS
-# =========================
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Estimasi Flow (Mean)", "—" if pd.isna(flow_est) else f"{flow_est:.2f}")
-c2.metric("Estimasi Occ (Mean)", "—" if pd.isna(occ_est) else f"{occ_est:.4f}")
-c3.metric("Status Kepadatan", status)
-c4.metric("Jumlah data (jam itu)", f"{n_est:,}")
+# status message box
+if status in ["Sangat Padat", "Padat"]:
+    st.warning(f"Status Lalu Lintas: **{status}**")
+elif status == "Sedang":
+    st.info(f"Status Lalu Lintas: **{status}**")
+else:
+    st.success(f"Status Lalu Lintas: **{status}**")
 
-st.divider()
+st.markdown("---")
 
 # =========================
-# MAIN PANELS
+# MAIN LAYOUT (kiri peta/visual, kanan kartu metrik)
 # =========================
-left, right = st.columns([1.2, 1])
+left, right = st.columns([1.15, 1])
 
 with left:
-    st.subheader("Grafik 24 Jam (Rata-rata Historis)")
-    if len(agg) == 0:
-        st.warning("Tidak ada data setelah filter diterapkan.")
+    st.subheader("Peta / Visualisasi Lalu Lintas Basel")
+
+    # Kalau ada koordinat (lat/lon) bisa st.map. Saat ini Basel tidak ada -> fallback.
+    has_coords = all(col in df_f.columns for col in ["lat", "lon"])  # kalau nanti kamu punya
+    if has_coords:
+        # contoh: tampilkan titik per detid pada jam terpilih
+        det_hour = df_f[df_f["hour_bin"] == hour_selected].copy()
+        det_hour = det_hour.dropna(subset=["lat", "lon"])
+        st.map(det_hour.rename(columns={"lat":"latitude","lon":"longitude"}))
+        st.caption("Peta menampilkan titik sensor pada jam yang dipilih.")
     else:
-        chart_df = agg.set_index("hour_bin")[["flow_mean", "occ_mean"]].copy()
-        st.line_chart(chart_df, height=360)
-        st.caption("Grafik menunjukkan rata-rata flow dan occ per jam (0–23) berdasarkan data historis.")
+        st.info("Dataset Basel tidak memiliki kolom koordinat (lat/lon), jadi peta tidak bisa ditampilkan. "
+                "Sebagai pengganti, ditampilkan Top Detektor (flow tertinggi) pada jam yang dipilih.")
+
+        det_rank = agg_by_detid_at_hour(df_f, hour_selected)
+        if len(det_rank) == 0:
+            st.warning("Tidak ada data untuk jam/filter yang dipilih.")
+        else:
+            top10 = det_rank.head(10).copy()
+            st.dataframe(top10, use_container_width=True, height=260)
+            st.bar_chart(top10.set_index("detid")[["flow_mean"]], height=260)
+
+    st.markdown("")
 
 with right:
-    st.subheader("Tabel Ringkas per Jam")
-    if len(agg) == 0:
-        st.info("Tabel tidak tersedia karena data kosong.")
+    st.subheader("Prediksi & Analisis Lalu Lintas (Historis)")
+
+    r1, r2 = st.columns(2)
+    with r1:
+        st.metric("Volume Lalu Lintas (Flow Mean)", "—" if pd.isna(flow_est) else f"{flow_est:.2f}")
+    with r2:
+        st.metric("Okupansi Jalan (Occ Mean)", "—" if pd.isna(occ_est) else f"{occ_est:.4f}")
+
+    r3, r4 = st.columns(2)
+    with r3:
+        st.metric("Jam Dipilih", f"{hour_selected}:00")
+    with r4:
+        st.metric("Jumlah Data (jam itu)", f"{n_est:,}")
+
+    st.markdown("#### Grafik 24 Jam (Rata-rata Historis)")
+    if len(agg24) == 0:
+        st.warning("Data kosong setelah filter.")
     else:
-        st.dataframe(
-            agg.rename(columns={
-                "hour_bin": "jam",
-                "flow_mean": "flow_rata2",
-                "occ_mean": "occ_rata2",
-                "n": "jumlah_data"
-            }),
-            use_container_width=True,
-            height=360
-        )
+        # pisahkan jadi 2 grafik biar occ terbaca jelas
+        st.line_chart(agg24.set_index("hour_bin")[["flow_mean"]], height=210)
+        st.line_chart(agg24.set_index("hour_bin")[["occ_mean"]], height=210)
 
-st.divider()
-
-# =========================
-# EXTRA INSIGHTS
-# =========================
-st.subheader("Insight Tambahan (Lokasi Sensor)")
-
-if "detid" in df.columns:
-    df_top = df.copy()
-    if mode_hari != "Semua":
-        df_top = df_top[df_top["kategori_hari"] == mode_hari]
-    if use_date_filter and start_date and end_date:
-        df_top = df_top[(df_top["day"].dt.date >= start_date) & (df_top["day"].dt.date <= end_date)]
-
-    top_det = (
-        df_top.dropna(subset=["detid", "flow"])
-              .groupby("detid", as_index=False)["flow"]
-              .mean()
-              .sort_values("flow", ascending=False)
-              .head(10)
-              .rename(columns={"flow": "flow_rata2"})
-    )
-
-    st.caption("Top 10 detid dengan rata-rata flow tertinggi (berdasarkan filter hari/tanggal).")
-    st.dataframe(top_det, use_container_width=True)
-else:
-    st.info("Kolom detid tidak tersedia pada dataset yang dimuat.")
-
-st.divider()
-
-st.subheader("Contoh Data (Sample)")
-show_cols = [c for c in ["day","interval","hour","hour_bin","detid","city","flow","occ","error","speed"] if c in df_f.columns]
-if len(df_f) > 0:
-    st.dataframe(df_f[show_cols].sample(min(15, len(df_f)), random_state=42), use_container_width=True)
-else:
-    st.info("Tidak ada data untuk ditampilkan.")
-
-st.caption("Catatan: Deploy ini memakai pendekatan statistik sederhana (mean historis per jam). Tidak ada proses training model ML saat deploy.")
+    st.caption("Catatan: Estimasi ini memakai rata-rata historis pada jam yang sama (tanpa training ML saat deploy).")
